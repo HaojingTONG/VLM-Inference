@@ -4,8 +4,8 @@ accelerate
 Pillow
 pyyaml
 qwen-vl-utils
-vllm
-flash-attn
+# vllm
+# flash-attn
 matplotlib
 pandas
 tqdm
