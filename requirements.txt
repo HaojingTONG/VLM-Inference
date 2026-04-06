@@ -1,0 +1,11 @@
+torch>=2.0
+transformers>=4.40
+accelerate
+Pillow
+pyyaml
+qwen-vl-utils
+vllm
+flash-attn
+matplotlib
+pandas
+tqdm

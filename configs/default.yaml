@@ -1,0 +1,47 @@
+# ============================================================
+# Efficient VLM Inference via Visual Token Compression
+# Default experiment configuration
+# ============================================================
+
+model:
+  name: "Qwen/Qwen2.5-VL-3B-Instruct"  # or Qwen/Qwen2.5-VL-7B-Instruct
+  dtype: "float16"
+  device: "cuda"
+  max_new_tokens: 256
+
+compression:
+  method: "none"  # none | fixed_ratio | importance | token_merging
+  retention_ratio: 1.0  # 1.0 = no compression, 0.75, 0.5, 0.25, 0.1
+  # importance-based pruning
+  importance_signal: "attention"  # attention | magnitude | similarity
+  pruning_layer: 2  # LLM layer after which to prune (FastV-style)
+  # token merging
+  merge_method: "mean"  # mean | weighted
+  similarity_metric: "cosine"  # cosine | dot
+
+benchmark:
+  resolutions: ["low", "medium", "high"]  # input scales
+  num_images: [1, 2, 4]  # context density
+  retention_ratios: [1.0, 0.75, 0.5, 0.25, 0.1]  # compression intensity
+
+data:
+  dataset: "vqa_v2"  # vqa_v2 | llava_bench | synthetic
+  data_dir: "./data"
+  num_samples: 500  # subset size for evaluation
+  seed: 42
+
+evaluation:
+  metrics:
+    - latency_ms
+    - throughput_samples_per_sec
+    - peak_gpu_memory_mb
+    - max_batch_size
+    - accuracy
+  batch_size: 1
+  num_warmup: 3
+  num_runs: 10
+
+output:
+  results_dir: "./results"
+  save_predictions: true
+  save_profiling: true
