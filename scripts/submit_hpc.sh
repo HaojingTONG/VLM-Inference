@@ -11,12 +11,16 @@
 
 module purge
 module load cuda/12.1
-module load python/3.10
 
+# ======== TODO: 根据你的实际情况修改以下两项 ========
+# 1. conda 路径: 运行 `which conda` 确认
+# 2. 环境名: 你创建环境时用的名字
 source ~/.bashrc
-conda activate vlm-compress  # or your env name
+conda activate vlm-compress
+# ==================================================
 
-cd $SLURM_SUBMIT_DIR
+# 切换到项目目录 (TODO: 改成你的 NetID)
+cd /scratch/<your-netid>/Project
 
 python scripts/run_benchmark.py \
     --config configs/default.yaml \
