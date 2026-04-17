@@ -49,7 +49,8 @@ class CompressedVLM:
 
         visual = self._get_visual_module()
         vision_dtype = next(visual.parameters()).dtype
-        image_embeds = visual(pixel_values.to(vision_dtype), grid_thw=image_grid_thw)
+        vis_out = visual(pixel_values.to(vision_dtype), grid_thw=image_grid_thw)
+        image_embeds = self._unwrap_vision_output(vis_out)
         # image_embeds: (sum_visual_tokens, hidden_dim) after spatial merge
 
         merge = self.spatial_merge_size
@@ -133,6 +134,19 @@ class CompressedVLM:
             else:
                 i += 1
         return spans
+
+    @staticmethod
+    def _unwrap_vision_output(out):
+        """Normalize the vision tower output across transformers versions."""
+        if isinstance(out, torch.Tensor):
+            return out
+        for attr in ("last_hidden_state", "image_embeds", "hidden_states"):
+            val = getattr(out, attr, None)
+            if isinstance(val, torch.Tensor):
+                return val
+        if isinstance(out, (tuple, list)) and len(out) > 0 and isinstance(out[0], torch.Tensor):
+            return out[0]
+        raise TypeError(f"Unexpected vision tower output type: {type(out)}")
 
     def _get_visual_module(self):
         if hasattr(self.model, "visual"):
