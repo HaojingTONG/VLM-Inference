@@ -47,15 +47,9 @@ class CompressedVLM:
         pixel_values = inputs["pixel_values"]
         image_grid_thw = inputs["image_grid_thw"]
 
-        visual = self._get_visual_module()
-        vision_dtype = next(visual.parameters()).dtype
-        vis_out = visual(pixel_values.to(vision_dtype), grid_thw=image_grid_thw)
-        image_embeds = self._unwrap_vision_output(vis_out)
-        # image_embeds: (sum_visual_tokens, hidden_dim) after spatial merge
-
+        per_image = self._compute_image_embeds(pixel_values, image_grid_thw)
         merge = self.spatial_merge_size
         split_sizes = (image_grid_thw.prod(dim=-1) // (merge * merge)).tolist()
-        per_image = list(torch.split(image_embeds, split_sizes))
 
         compressed_per_image = [
             self.compressor.compress(emb.unsqueeze(0)).squeeze(0) for emb in per_image
@@ -134,6 +128,65 @@ class CompressedVLM:
             else:
                 i += 1
         return spans
+
+    @torch.no_grad()
+    def _compute_image_embeds(self, pixel_values, image_grid_thw):
+        """Return per-image merged visual embeddings as a list of (N_i, hidden) tensors.
+
+        Prefers the model's own ``get_image_features`` helper (handles the
+        PatchMerger correctly across transformers versions). Falls back to
+        calling ``model.visual`` directly and then applying the merger.
+        """
+        merge = self.spatial_merge_size
+        post_merge_sizes = (image_grid_thw.prod(dim=-1) // (merge * merge)).tolist()
+
+        # Path 1: use model.get_image_features / model.model.get_image_features
+        for obj in (self.model, getattr(self.model, "model", None)):
+            if obj is None:
+                continue
+            fn = getattr(obj, "get_image_features", None)
+            if not callable(fn):
+                continue
+            try:
+                out = fn(pixel_values, image_grid_thw)
+            except TypeError:
+                continue
+            if isinstance(out, (list, tuple)):
+                return [t for t in out]
+            if isinstance(out, torch.Tensor):
+                # Could be already-split via torch.split (tuple of tensors) or a single concat
+                if out.shape[0] == sum(post_merge_sizes):
+                    return list(torch.split(out, post_merge_sizes))
+
+        # Path 2: call visual directly, handle pre- or post-merge output
+        visual = self._get_visual_module()
+        vision_dtype = next(visual.parameters()).dtype
+        vis_out = visual(pixel_values.to(vision_dtype), grid_thw=image_grid_thw)
+        embeds = self._unwrap_vision_output(vis_out)
+
+        total = embeds.shape[0]
+        if total == sum(post_merge_sizes):
+            return list(torch.split(embeds, post_merge_sizes))
+
+        pre_merge_sizes = image_grid_thw.prod(dim=-1).tolist()
+        if total == sum(pre_merge_sizes):
+            merger = getattr(visual, "merger", None)
+            if merger is None:
+                raise RuntimeError(
+                    "Vision tower returned pre-merge tokens but no .merger submodule found."
+                )
+            merged = merger(embeds)
+            if merged.shape[0] != sum(post_merge_sizes):
+                raise RuntimeError(
+                    f"After merger: got {merged.shape[0]} tokens, "
+                    f"expected {sum(post_merge_sizes)}."
+                )
+            return list(torch.split(merged, post_merge_sizes))
+
+        raise RuntimeError(
+            f"Cannot reconcile vision output size {total} with grid_thw "
+            f"(pre={sum(pre_merge_sizes)}, post={sum(post_merge_sizes)})."
+        )
 
     @staticmethod
     def _unwrap_vision_output(out):
