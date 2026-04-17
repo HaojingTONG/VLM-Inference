@@ -2,6 +2,7 @@ from .base import BaseCompressor
 from .fixed_ratio import FixedRatioPruner
 from .importance import ImportanceBasedPruner
 from .token_merging import TokenMerger
+from .hook import CompressedVLM
 
 COMPRESSORS = {
     "none": None,
