@@ -1,11 +1,27 @@
 """Token merging: merge similar visual tokens instead of dropping them."""
 
 import torch
+import torch.nn.functional as F
+
 from .base import BaseCompressor
 
 
 class TokenMerger(BaseCompressor):
-    """Merge similar visual tokens via bipartite matching (ToMe-style)."""
+    """ToMe-style bipartite token merging.
+
+    Each pass:
+      1. Splits tokens into a (even-indexed) "source" set and b (odd-indexed)
+         "destination" set.
+      2. For each token in a, finds its most similar partner in b.
+      3. Picks the top-r src tokens with the highest similarity to merge,
+         where r = min(num_to_remove, |a|).
+      4. Each merged src is averaged into its best dst (running mean weighted
+         by the number of tokens fused so far).
+
+    A single pass can remove at most |a| ~= n/2 tokens, so for aggressive
+    compression (retention < 50%) we run multiple passes. The total cost is
+    O(log(n/k)) GPU passes instead of O(n - k) Python iterations.
+    """
 
     def __init__(self, config):
         super().__init__(config)
@@ -13,64 +29,79 @@ class TokenMerger(BaseCompressor):
         self.similarity_metric = config.get("similarity_metric", "cosine")
 
     def compress(self, visual_tokens: torch.Tensor, **kwargs) -> torch.Tensor:
-        """Iteratively merge the most similar token pairs until target count.
+        """Iteratively merge tokens via vectorized bipartite matching.
 
         Args:
             visual_tokens: (batch, num_tokens, hidden_dim)
 
         Returns:
-            Merged visual tokens: (batch, k, hidden_dim)
+            (batch, k, hidden_dim) where k = retention_ratio * num_tokens.
         """
-        batch, num_tokens, dim = visual_tokens.shape
+        batch, num_tokens, _ = visual_tokens.shape
         k = self._num_tokens_to_keep(num_tokens)
-        num_merges = num_tokens - k
+        if k >= num_tokens:
+            return visual_tokens
 
-        tokens = visual_tokens.clone()
-
-        for _ in range(num_merges):
-            tokens = self._merge_step(tokens)
-
+        tokens = visual_tokens
+        while tokens.shape[1] > k:
+            target_remove = tokens.shape[1] - k
+            tokens = self._bipartite_merge(tokens, target_remove)
         return tokens
 
-    def _merge_step(self, tokens: torch.Tensor) -> torch.Tensor:
-        """Single merge step: find the most similar adjacent pair and merge."""
-        batch, n, dim = tokens.shape
+    def _bipartite_merge(self, tokens: torch.Tensor, num_to_remove: int) -> torch.Tensor:
+        """One vectorized ToMe pass that removes up to |a| tokens at once."""
+        B, n, D = tokens.shape
 
-        # ToMe-style bipartite: split into two sets (even/odd indices)
-        a = tokens[:, 0::2, :]  # source set
-        b = tokens[:, 1::2, :]  # destination set
+        # Even / odd split
+        a = tokens[:, 0::2, :]  # (B, |a|, D)
+        b = tokens[:, 1::2, :]  # (B, |b|, D)
+        len_a = a.shape[1]
+        len_b = b.shape[1]
 
-        # Compute similarity between a and b
+        # Cap removal at |a|; one pass can't remove more than the size of a.
+        r = min(num_to_remove, len_a)
+        if r <= 0:
+            return tokens
+
+        # Pairwise similarity a -> b
         if self.similarity_metric == "cosine":
-            a_norm = torch.nn.functional.normalize(a, dim=-1)
-            b_norm = torch.nn.functional.normalize(b, dim=-1)
-            sim = torch.bmm(a_norm, b_norm.transpose(1, 2))  # (B, |A|, |B|)
-        else:
+            a_n = F.normalize(a, dim=-1)
+            b_n = F.normalize(b, dim=-1)
+            sim = torch.bmm(a_n, b_n.transpose(1, 2))  # (B, |a|, |b|)
+        else:  # dot
             sim = torch.bmm(a, b.transpose(1, 2))
 
-        # For each token in a, find the most similar token in b
-        max_sim, max_idx = sim.max(dim=-1)  # (B, |A|)
+        # For each src in a, best dst index in b and the similarity score
+        sim_max, best_dst = sim.max(dim=-1)  # (B, |a|), (B, |a|)
 
-        # Find the single most similar pair across all of a
-        _, merge_src = max_sim.max(dim=-1)  # (B,)
+        # Pick the top-r src indices (highest similarity to their best dst)
+        sorted_score, sorted_idx = sim_max.sort(dim=-1, descending=True)
+        merge_src_idx = sorted_idx[:, :r]  # (B, r)
+        keep_src_idx = sorted_idx[:, r:]   # (B, |a| - r)
 
-        result_list = []
-        for bi in range(batch):
-            src_idx = merge_src[bi].item()
-            dst_idx = max_idx[bi, src_idx].item()
+        # For each merged src, look up its destination in b
+        merge_dst_idx = torch.gather(best_dst, 1, merge_src_idx)  # (B, r)
 
-            merged = (a[bi, src_idx] + b[bi, dst_idx]) / 2.0
+        # Gather the actual src embeddings to merge
+        src_embeds = torch.gather(
+            a, 1, merge_src_idx.unsqueeze(-1).expand(-1, -1, D)
+        )  # (B, r, D)
 
-            # Rebuild: keep all tokens except the merged pair, add merged token
-            keep_a = [i for i in range(a.shape[1]) if i != src_idx]
-            keep_b = [i for i in range(b.shape[1]) if i != dst_idx]
+        # Running mean: each b token starts as itself with weight 1; each merged
+        # src adds its embedding and weight 1 to the chosen dst, then we divide.
+        b_sum = b.clone()
+        b_sum.scatter_add_(
+            1, merge_dst_idx.unsqueeze(-1).expand(-1, -1, D), src_embeds
+        )
+        b_count = torch.ones(B, len_b, device=b.device, dtype=b.dtype)
+        ones_r = torch.ones(B, r, device=b.device, dtype=b.dtype)
+        b_count.scatter_add_(1, merge_dst_idx, ones_r)
+        b_avg = b_sum / b_count.unsqueeze(-1)
 
-            parts = []
-            if keep_a:
-                parts.append(a[bi, keep_a])
-            if keep_b:
-                parts.append(b[bi, keep_b])
-            parts.append(merged.unsqueeze(0))
-            result_list.append(torch.cat(parts, dim=0))
+        # Surviving src tokens (not merged)
+        keep_src = torch.gather(
+            a, 1, keep_src_idx.unsqueeze(-1).expand(-1, -1, D)
+        )  # (B, |a| - r, D)
 
-        return torch.stack(result_list, dim=0)
+        # Concatenate surviving src + averaged dst
+        return torch.cat([keep_src, b_avg], dim=1)
