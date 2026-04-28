@@ -9,3 +9,4 @@ qwen-vl-utils
 matplotlib
 pandas
 tqdm
+datasets>=2.14
