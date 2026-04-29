@@ -21,6 +21,8 @@ codepath).
 """
 
 import math
+from types import SimpleNamespace
+
 import torch
 
 
@@ -43,8 +45,8 @@ class CompressedVLM:
 
     @torch.no_grad()
     def _generate_with_compression(self, inputs, **gen_kwargs):
-        prepared, precomputed_embeds = self._prepare_compressed_inputs(inputs)
-        target, restore_state = self._patch_get_image_features(precomputed_embeds)
+        prepared, compressed_per_image = self._prepare_compressed_inputs(inputs)
+        target, restore_state = self._patch_get_image_features(compressed_per_image)
         try:
             return self.model.generate(**prepared, **gen_kwargs)
         finally:
@@ -68,12 +70,15 @@ class CompressedVLM:
         compressed_per_image = [
             self.compressor.compress(emb.unsqueeze(0)).squeeze(0) for emb in per_image
         ]
-        new_lens = [emb.shape[0] for emb in compressed_per_image]
-        new_image_embeds = torch.cat(compressed_per_image, dim=0)
 
-        # Cast to model dtype/device so masked_scatter inside forward succeeds
+        # Cast each per-image tensor to model dtype/device so the model's
+        # downstream masked_scatter / cat / .to() in forward all succeed.
         target_dtype = self.model.get_input_embeddings().weight.dtype
-        new_image_embeds = new_image_embeds.to(self.model.device, dtype=target_dtype)
+        compressed_per_image = [
+            emb.to(self.model.device, dtype=target_dtype)
+            for emb in compressed_per_image
+        ]
+        new_lens = [emb.shape[0] for emb in compressed_per_image]
 
         # Shrink each image_pad run in input_ids/attention_mask to match
         new_input_ids, new_attention_mask = self._rewrite_image_spans(
@@ -94,19 +99,35 @@ class CompressedVLM:
             "pixel_values": pixel_values,
             "image_grid_thw": new_image_grid_thw,
         }
-        return prepared, new_image_embeds
+        return prepared, compressed_per_image
 
     # --- monkey-patch helpers ---
-    def _patch_get_image_features(self, precomputed_embeds):
-        """Patch the inner Qwen2.5-VL model so get_image_features returns precomputed embeds.
+    def _patch_get_image_features(self, compressed_per_image):
+        """Patch the inner Qwen2.5-VL model so get_image_features returns
+        our precomputed compressed embeddings.
 
-        We patch on the instance level so we don't disturb the class.
+        Different transformers versions call this differently:
+          * old: ``image_embeds = self.get_image_features(pv, grid)``  -> tensor
+          * new: ``image_embeds = self.get_image_features(pv, grid, return_dict=True).pooler_output``
+                 followed by ``torch.cat(image_embeds, dim=0)``
+
+        We support both: when return_dict=True we return an object with a
+        ``pooler_output`` attribute set to the per-image tuple; otherwise
+        we return the concatenated tensor.
         """
         target = self._find_get_image_features_owner()
+        per_image_tuple = tuple(compressed_per_image)
+        cat_tensor = torch.cat(compressed_per_image, dim=0) if compressed_per_image \
+            else torch.empty(0)
 
-        # Closure-captured precomputed embeds; ignore positional args from caller
         def patched(*args, **kwargs):
-            return precomputed_embeds
+            if kwargs.get("return_dict", False):
+                # New transformers path: callsite does
+                #   .pooler_output -> torch.cat(..., dim=0)
+                # so pooler_output must be an iterable of per-image tensors.
+                return SimpleNamespace(pooler_output=per_image_tuple)
+            # Legacy path: callsite expects a single concatenated tensor.
+            return cat_tensor
 
         had_instance_attr = "get_image_features" in target.__dict__
         original_attr = target.__dict__.get("get_image_features")
