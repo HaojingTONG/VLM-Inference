@@ -48,9 +48,17 @@ class CompressedVLM:
         prepared, compressed_per_image = self._prepare_compressed_inputs(inputs)
         target, restore_state = self._patch_get_image_features(compressed_per_image)
         try:
-            return self.model.generate(**prepared, **gen_kwargs)
+            out = self.model.generate(**prepared, **gen_kwargs)
         finally:
             self._unpatch_get_image_features(target, restore_state)
+        # Slice off the prompt portion using the PREPARED input length.
+        # We rewrite input_ids so each image_pad run shrinks from old_lens[i]
+        # to new_lens[i], so prepared.shape[1] != original.shape[1] whenever
+        # any compression actually happens. Returning only the new tokens
+        # gives callers a stable contract regardless of compression ratio:
+        # they should NOT slice with the original input_ids length.
+        prepared_len = prepared["input_ids"].shape[1]
+        return out[:, prepared_len:]
 
     # --- core: precompute compressed embeds + reshape input_ids/grid_thw ---
     @torch.no_grad()
@@ -251,55 +259,21 @@ class CompressedVLM:
     def _compute_image_embeds(self, pixel_values, image_grid_thw):
         """Return per-image merged visual embeddings as a list of (N_i, hidden) tensors.
 
-        Critically: this must run the vision tower at most ONCE. Earlier
-        versions blindly retried get_image_features in a loop until the
-        return type matched a tensor, which on new transformers (where
-        the function returns a wrapper object by default) caused 2x or
-        even 3x vision-tower work.
+        This calls the vision tower (and merger if needed) directly. We
+        deliberately bypass ``model.get_image_features`` because:
+          * On new transformers it returns a wrapper object whose internal
+            shape varies across versions, and earlier defensive isinstance
+            checks caused us to retry the call up to 3 times -- each retry
+            re-runs the vision tower and accounted for the entire 325ms
+            wrapper overhead seen in Section 8b.
+          * Calling visual + merger directly is exactly what
+            get_image_features does internally, so we don't lose
+            functionality.
+        Result: vision tower runs exactly ONCE per call.
         """
         merge = self.spatial_merge_size
         post_merge_sizes = (image_grid_thw.prod(dim=-1) // (merge * merge)).tolist()
 
-        # Path 1: model's own get_image_features. Try the new API
-        # (return_dict=True -> object with .pooler_output) first, then
-        # the legacy positional-only API. STOP after the first successful
-        # call, even if we have to extract from an object.
-        for obj in (self.model, getattr(self.model, "model", None)):
-            if obj is None:
-                continue
-            fn = getattr(obj, "get_image_features", None)
-            if not callable(fn):
-                continue
-
-            # New API: return_dict=True -> ModelOutput with .pooler_output
-            try:
-                out = fn(pixel_values, image_grid_thw, return_dict=True)
-            except TypeError:
-                out = None
-
-            if out is not None and hasattr(out, "pooler_output"):
-                pooler = out.pooler_output
-                if isinstance(pooler, (list, tuple)):
-                    return list(pooler)
-                if isinstance(pooler, torch.Tensor):
-                    if pooler.shape[0] == sum(post_merge_sizes):
-                        return list(torch.split(pooler, post_merge_sizes))
-                # Returned a wrapper but the contents don't match expected
-                # shape -- treat as failure and try the next candidate.
-                continue
-
-            # Legacy API: positional only -> tensor or list
-            try:
-                out = fn(pixel_values, image_grid_thw)
-            except TypeError:
-                continue
-            if isinstance(out, (list, tuple)):
-                return [t for t in out]
-            if isinstance(out, torch.Tensor):
-                if out.shape[0] == sum(post_merge_sizes):
-                    return list(torch.split(out, post_merge_sizes))
-
-        # Path 2: visual tower directly + merger fallback
         visual = self._get_visual_module()
         vision_dtype = next(visual.parameters()).dtype
         vis_out = visual(pixel_values.to(vision_dtype), grid_thw=image_grid_thw)
