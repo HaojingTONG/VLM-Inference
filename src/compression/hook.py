@@ -249,17 +249,46 @@ class CompressedVLM:
     # --- vision tower path used during _prepare_compressed_inputs ---
     @torch.no_grad()
     def _compute_image_embeds(self, pixel_values, image_grid_thw):
-        """Return per-image merged visual embeddings as a list of (N_i, hidden) tensors."""
+        """Return per-image merged visual embeddings as a list of (N_i, hidden) tensors.
+
+        Critically: this must run the vision tower at most ONCE. Earlier
+        versions blindly retried get_image_features in a loop until the
+        return type matched a tensor, which on new transformers (where
+        the function returns a wrapper object by default) caused 2x or
+        even 3x vision-tower work.
+        """
         merge = self.spatial_merge_size
         post_merge_sizes = (image_grid_thw.prod(dim=-1) // (merge * merge)).tolist()
 
-        # Path 1: model's own get_image_features (handles PatchMerger correctly)
+        # Path 1: model's own get_image_features. Try the new API
+        # (return_dict=True -> object with .pooler_output) first, then
+        # the legacy positional-only API. STOP after the first successful
+        # call, even if we have to extract from an object.
         for obj in (self.model, getattr(self.model, "model", None)):
             if obj is None:
                 continue
             fn = getattr(obj, "get_image_features", None)
             if not callable(fn):
                 continue
+
+            # New API: return_dict=True -> ModelOutput with .pooler_output
+            try:
+                out = fn(pixel_values, image_grid_thw, return_dict=True)
+            except TypeError:
+                out = None
+
+            if out is not None and hasattr(out, "pooler_output"):
+                pooler = out.pooler_output
+                if isinstance(pooler, (list, tuple)):
+                    return list(pooler)
+                if isinstance(pooler, torch.Tensor):
+                    if pooler.shape[0] == sum(post_merge_sizes):
+                        return list(torch.split(pooler, post_merge_sizes))
+                # Returned a wrapper but the contents don't match expected
+                # shape -- treat as failure and try the next candidate.
+                continue
+
+            # Legacy API: positional only -> tensor or list
             try:
                 out = fn(pixel_values, image_grid_thw)
             except TypeError:
