@@ -1,21 +1,33 @@
-"""Quality metrics for evaluating VLM outputs."""
+"""Quality and efficiency metrics for evaluating VLM outputs."""
+
+from .vqa import (
+    exact_match_score,
+    official_vqa_score,
+    normalize_answer,
+    score_vqa_prediction,
+)
+
+
+def compute_exact_match_accuracy(predictions, references):
+    """Compute normalized exact-match accuracy against one reference per item."""
+    scores = [
+        exact_match_score(pred, ref)
+        for pred, ref in zip(predictions, references)
+    ]
+    return sum(scores) / len(scores) if scores else 0.0
 
 
 def compute_vqa_accuracy(predictions, references):
-    """Simple exact-match VQA accuracy.
+    """Backward-compatible alias for normalized exact match.
 
-    Args:
-        predictions: List of predicted answer strings.
-        references: List of ground-truth answer strings.
-
-    Returns:
-        Accuracy as a float in [0, 1].
+    This repository used to expose ``compute_vqa_accuracy`` as a simple
+    string exact-match metric. That is not official VQA accuracy. New code
+    should call ``official_vqa_score`` only after validating that each sample
+    contains the 10 human answers required by the VQA protocol, or use
+    ``compute_exact_match_accuracy`` for single-reference / multiple-choice
+    datasets.
     """
-    correct = sum(
-        1 for pred, ref in zip(predictions, references)
-        if pred.strip().lower() == ref.strip().lower()
-    )
-    return correct / len(predictions) if predictions else 0.0
+    return compute_exact_match_accuracy(predictions, references)
 
 
 def compute_token_stats(visual_tokens_before, visual_tokens_after):
