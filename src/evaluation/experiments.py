@@ -446,6 +446,136 @@ def run_vqa_quality_sweep(
     return pd.DataFrame(summary_rows), pd.DataFrame(prediction_rows)
 
 
+def bootstrap_quality_ci(
+    df_predictions: pd.DataFrame,
+    n_bootstrap: int = 1000,
+    ci: float = 0.95,
+    seed: int = 123,
+) -> pd.DataFrame:
+    """Bootstrap confidence intervals over per-question quality scores."""
+    valid = df_predictions.dropna(subset=["score"]).copy()
+    if valid.empty:
+        return pd.DataFrame(
+            columns=[
+                "method",
+                "retention_ratio",
+                "mean_score",
+                "ci_low",
+                "ci_high",
+                "n_scored",
+            ]
+        )
+
+    rng = np.random.default_rng(seed)
+    alpha = 1.0 - ci
+    rows = []
+    for (method, ratio), group in valid.groupby(["method", "retention_ratio"]):
+        scores = group["score"].to_numpy(dtype=float)
+        boot_means = []
+        for _ in range(n_bootstrap):
+            sample = rng.choice(scores, size=len(scores), replace=True)
+            boot_means.append(float(sample.mean()))
+        rows.append(
+            {
+                "method": method,
+                "retention_ratio": ratio,
+                "mean_score": float(scores.mean()),
+                "ci_low": float(np.quantile(boot_means, alpha / 2)),
+                "ci_high": float(np.quantile(boot_means, 1 - alpha / 2)),
+                "n_scored": len(scores),
+            }
+        )
+    return pd.DataFrame(rows).sort_values(["method", "retention_ratio"]).reset_index(drop=True)
+
+
+def run_max_batch_size_probe(
+    model,
+    processor,
+    device: str = "cuda",
+    resolution_name: str = "medium",
+    resolution: tuple[int, int] = (896, 896),
+    methods: list[str] | None = None,
+    retention_ratios: list[float] | None = None,
+    max_batch_size: int = 8,
+    max_new_tokens: int = 8,
+    prompt: str = "Describe this image briefly.",
+    seed: int = 900,
+) -> pd.DataFrame:
+    """Find max feasible batch size before OOM for selected configurations."""
+    methods = methods or ["none", "token_merging"]
+    retention_ratios = retention_ratios or [1.0, 0.5]
+    height, width = resolution
+    image = make_random_image(height, width, seed)
+    rows = []
+
+    for method in methods:
+        ratios = [1.0] if method == "none" else [r for r in retention_ratios if r < 1.0]
+        for ratio in ratios:
+            wrapper = build_compressed_wrapper(model, processor, method, ratio)
+
+            def batched_inference(batch_size):
+                images = [image] * batch_size
+                messages_batch = [
+                    [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image", "image": img},
+                                {"type": "text", "text": prompt},
+                            ],
+                        }
+                    ]
+                    for img in images
+                ]
+                texts = [
+                    processor.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
+                    for messages in messages_batch
+                ]
+                inputs = processor(
+                    text=texts,
+                    images=images,
+                    padding=True,
+                    return_tensors="pt",
+                ).to(device)
+                return wrapper.generate(
+                    inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                )
+
+            try:
+                max_bs = InferenceProfiler.find_max_batch_size(
+                    lambda batch_size: batched_inference(batch_size),
+                    min_bs=1,
+                    max_bs=max_batch_size,
+                )
+                error = ""
+            except Exception as exc:
+                max_bs = None
+                error = f"{type(exc).__name__}: {exc}"
+            rows.append(
+                {
+                    "resolution": resolution_name,
+                    "height": height,
+                    "width": width,
+                    "method": method,
+                    "retention_ratio": ratio,
+                    "max_batch_size": max_bs,
+                    "probe_max_batch_size": max_batch_size,
+                    "max_new_tokens": max_new_tokens,
+                    "error": error,
+                }
+            )
+            torch.cuda.empty_cache()
+            gc.collect()
+
+    return pd.DataFrame(rows)
+
+
 def save_results(output_dir: str | Path, **frames: pd.DataFrame) -> dict[str, str]:
     """Save DataFrames to CSV and JSON records for reproducible analysis."""
     path = Path(output_dir)

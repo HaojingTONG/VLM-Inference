@@ -41,6 +41,52 @@ def plot_quality_vs_compression(df_quality: pd.DataFrame, metric_label: str, out
     return fig
 
 
+def plot_quality_ci_vs_compression(
+    df_quality_ci: pd.DataFrame,
+    metric_label: str,
+    output_dir="results",
+):
+    """Plot task quality with bootstrap confidence intervals."""
+    fig, ax = plt.subplots(figsize=(8, 5))
+    baseline = df_quality_ci[df_quality_ci["method"] == "none"]
+    if not baseline.empty:
+        row = baseline.iloc[0]
+        ax.axhline(
+            row["mean_score"],
+            color="black",
+            linestyle="--",
+            alpha=0.6,
+            label=f"baseline ({row['mean_score']:.3f})",
+        )
+        ax.axhspan(row["ci_low"], row["ci_high"], color="black", alpha=0.08)
+
+    for method, group in df_quality_ci[df_quality_ci["method"] != "none"].groupby("method"):
+        group = group.sort_values("retention_ratio")
+        yerr = [
+            group["mean_score"] - group["ci_low"],
+            group["ci_high"] - group["mean_score"],
+        ]
+        ax.errorbar(
+            group["retention_ratio"],
+            group["mean_score"],
+            yerr=yerr,
+            marker="o",
+            capsize=3,
+            linewidth=2,
+            label=method,
+        )
+
+    ax.set_xlabel("Visual token retention ratio")
+    ax.set_ylabel(metric_label)
+    ax.set_title(f"{metric_label} vs compression with bootstrap CI")
+    ax.invert_xaxis()
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    _save(fig, output_dir, "quality_ci_vs_compression.png")
+    return fig
+
+
 def plot_latency_vs_compression(df_perf: pd.DataFrame, output_dir="results"):
     """Plot latency as token retention changes for each resolution."""
     resolutions = [r for r in ["low", "medium", "high"] if r in set(df_perf["resolution"])]
