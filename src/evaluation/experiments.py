@@ -20,6 +20,7 @@ from .vqa import (
     score_vqa_prediction,
     validate_vqa_schema,
 )
+from .metrics import compute_sequence_efficiency_metrics
 
 
 PROJECT_HYPOTHESES = [
@@ -836,6 +837,116 @@ def run_max_batch_size_probe(
             gc.collect()
 
     return pd.DataFrame(rows)
+
+
+def summarize_late_compression_effectiveness(
+    sequence_df: pd.DataFrame,
+    stage_summary_df: pd.DataFrame | None = None,
+    extreme_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Summarize late-compression benefits without overstating latency gains.
+
+    Late compression can reduce the tensors entering the LLM even when
+    end-to-end latency does not improve. This table separates those effects:
+    token/sequence reductions, theoretical LLM attention and KV-cache proxies,
+    measured isolated prefill timing, and measured end-to-end speed.
+    """
+    if sequence_df is None or sequence_df.empty:
+        return pd.DataFrame()
+
+    baseline_rows = sequence_df[sequence_df["method"] == "none"]
+    if baseline_rows.empty:
+        return pd.DataFrame()
+
+    baseline = baseline_rows.iloc[0]
+    baseline_seq = int(baseline["prepared_sequence_length"])
+    rows = []
+    for _, row in sequence_df.iterrows():
+        visual_before = int(row["visual_tokens_before_total"])
+        visual_after = int(row["visual_tokens_after_total"])
+        prepared_seq = int(row["prepared_sequence_length"])
+        metrics = compute_sequence_efficiency_metrics(
+            visual_before,
+            visual_after,
+            int(row["input_sequence_length"]),
+            prepared_seq,
+            baseline_sequence_length=baseline_seq,
+        )
+        rows.append(
+            {
+                "method": row["method"],
+                "retention_ratio": float(row["retention_ratio"]),
+                "visual_tokens_before": visual_before,
+                "visual_tokens_after": visual_after,
+                "input_sequence_length": int(row["input_sequence_length"]),
+                "prepared_sequence_length": prepared_seq,
+                **metrics,
+            }
+        )
+
+    summary = pd.DataFrame(rows)
+
+    if stage_summary_df is not None and not stage_summary_df.empty:
+        stage_cols = [
+            "method",
+            "retention_ratio",
+            "prefill_generate_1_token_ms",
+            "timed_total_ms",
+            "vision_encoder_forward_ms",
+            "compression_scoring_merging_ms",
+            "placeholder_rewrite_ms",
+        ]
+        present = [c for c in stage_cols if c in stage_summary_df.columns]
+        stage = stage_summary_df[present].copy()
+        summary = summary.merge(stage, on=["method", "retention_ratio"], how="left")
+        baseline_prefill = summary.loc[
+            summary["method"] == "none", "prefill_generate_1_token_ms"
+        ].dropna()
+        if not baseline_prefill.empty:
+            base_ms = float(baseline_prefill.iloc[0])
+            summary["measured_llm_prefill_speedup"] = (
+                base_ms / summary["prefill_generate_1_token_ms"]
+            )
+            summary.loc[
+                summary["prefill_generate_1_token_ms"].isna(),
+                "measured_llm_prefill_speedup",
+            ] = None
+
+    if extreme_df is not None and not extreme_df.empty:
+        cols = [
+            c
+            for c in ["method", "retention_ratio", "latency_ms", "speed_vs_baseline"]
+            if c in extreme_df.columns
+        ]
+        if {"method", "retention_ratio"}.issubset(cols):
+            extreme = extreme_df[cols].rename(
+                columns={
+                    "latency_ms": "measured_end_to_end_latency_ms",
+                    "speed_vs_baseline": "measured_end_to_end_speedup",
+                }
+            )
+            summary = summary.merge(extreme, on=["method", "retention_ratio"], how="left")
+
+    ordered = [
+        "method",
+        "retention_ratio",
+        "visual_tokens_before",
+        "visual_tokens_after",
+        "visual_token_reduction_pct",
+        "input_sequence_length",
+        "prepared_sequence_length",
+        "sequence_reduction_pct",
+        "attention_proxy_reduction_pct",
+        "attention_proxy_speedup",
+        "kv_cache_proxy_reduction_pct",
+        "prefill_generate_1_token_ms",
+        "measured_llm_prefill_speedup",
+        "measured_end_to_end_speedup",
+        "measured_end_to_end_latency_ms",
+    ]
+    return summary[[c for c in ordered if c in summary.columns]].sort_values(
+        ["method", "retention_ratio"]
+    ).reset_index(drop=True)
 
 
 def save_results(output_dir: str | Path, **frames: pd.DataFrame) -> dict[str, str]:

@@ -46,3 +46,37 @@ def compute_token_stats(visual_tokens_before, visual_tokens_after):
         "reduction_ratio": 1.0 - visual_tokens_after / visual_tokens_before,
         "retention_ratio": visual_tokens_after / visual_tokens_before,
     }
+
+
+def compute_sequence_efficiency_metrics(
+    visual_tokens_before,
+    visual_tokens_after,
+    input_sequence_length,
+    prepared_sequence_length,
+    baseline_sequence_length=None,
+):
+    """Compute honest LLM-side efficiency proxy metrics.
+
+    These metrics do not claim end-to-end speedup. They estimate how much work
+    late compression removes from the LLM-side prefill path after the image has
+    already been processed by the vision encoder.
+    """
+    baseline_sequence_length = baseline_sequence_length or input_sequence_length
+    visual_retention = visual_tokens_after / visual_tokens_before
+    sequence_retention = prepared_sequence_length / baseline_sequence_length
+    attention_proxy_retention = (
+        prepared_sequence_length * prepared_sequence_length
+    ) / (baseline_sequence_length * baseline_sequence_length)
+
+    return {
+        "effective_visual_token_retention": visual_retention,
+        "visual_token_reduction_pct": (1.0 - visual_retention) * 100.0,
+        "sequence_retention": sequence_retention,
+        "sequence_reduction_pct": (1.0 - sequence_retention) * 100.0,
+        "attention_prefill_cost_proxy": prepared_sequence_length * prepared_sequence_length,
+        "attention_proxy_retention": attention_proxy_retention,
+        "attention_proxy_reduction_pct": (1.0 - attention_proxy_retention) * 100.0,
+        "attention_proxy_speedup": 1.0 / attention_proxy_retention,
+        "kv_cache_proxy_retention": sequence_retention,
+        "kv_cache_proxy_reduction_pct": (1.0 - sequence_retention) * 100.0,
+    }

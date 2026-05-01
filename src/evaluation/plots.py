@@ -228,3 +228,53 @@ def plot_early_resize_tradeoff(
     fig.tight_layout()
     _save(fig, output_dir, "early_resize_quality_latency_tradeoff.png")
     return fig
+
+
+def plot_late_compression_effectiveness(df_effectiveness: pd.DataFrame, output_dir="results"):
+    """Plot LLM-side proxy gains against measured end-to-end speed."""
+    fig, ax = plt.subplots(figsize=(8, 5))
+    sub = df_effectiveness[df_effectiveness["method"] != "none"].copy()
+    if sub.empty:
+        ax.set_title("Late compression effectiveness unavailable")
+        fig.tight_layout()
+        _save(fig, output_dir, "late_compression_effectiveness.png")
+        return fig
+
+    for method, group in sub.groupby("method"):
+        group = group.sort_values("retention_ratio")
+        ax.plot(
+            group["retention_ratio"],
+            group["attention_proxy_speedup"],
+            marker="o",
+            linewidth=2,
+            label=f"{method} attention proxy",
+        )
+        if "measured_llm_prefill_speedup" in group:
+            ax.plot(
+                group["retention_ratio"],
+                group["measured_llm_prefill_speedup"],
+                marker="s",
+                linestyle="--",
+                linewidth=1.5,
+                label=f"{method} isolated prefill",
+            )
+        if "measured_end_to_end_speedup" in group:
+            ax.plot(
+                group["retention_ratio"],
+                group["measured_end_to_end_speedup"],
+                marker="x",
+                linestyle=":",
+                linewidth=1.5,
+                label=f"{method} end-to-end",
+            )
+
+    ax.axhline(1.0, color="black", linestyle="--", linewidth=1, alpha=0.6)
+    ax.set_xlabel("Visual token retention ratio")
+    ax.set_ylabel("Speedup or compute-reduction proxy")
+    ax.set_title("Late compression: LLM-side gains vs end-to-end speed")
+    ax.invert_xaxis()
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=7, ncol=2)
+    fig.tight_layout()
+    _save(fig, output_dir, "late_compression_effectiveness.png")
+    return fig
