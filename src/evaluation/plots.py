@@ -3,6 +3,7 @@
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 
 
@@ -84,6 +85,76 @@ def plot_quality_ci_vs_compression(
     ax.legend(fontsize=8)
     fig.tight_layout()
     _save(fig, output_dir, "quality_ci_vs_compression.png")
+    return fig
+
+
+def plot_accuracy_delta_vs_baseline(
+    df_quality: pd.DataFrame,
+    metric_label: str,
+    output_dir="results",
+):
+    """Plot accuracy change relative to the uncompressed baseline."""
+    baseline = df_quality[df_quality["method"] == "none"]["score"].mean()
+    compressed = df_quality[df_quality["method"] != "none"].copy()
+    compressed["delta_vs_baseline"] = compressed["score"] - baseline
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.axhline(0.0, color="black", linestyle="--", linewidth=1, alpha=0.7)
+    for method, group in compressed.groupby("method"):
+        group = group.sort_values("retention_ratio")
+        ax.plot(
+            group["retention_ratio"],
+            group["delta_vs_baseline"],
+            marker="o",
+            linewidth=2,
+            label=method,
+        )
+
+    ax.set_xlabel("Visual token retention ratio")
+    ax.set_ylabel(f"Delta {metric_label} vs baseline")
+    ax.set_title("Accuracy change relative to uncompressed baseline")
+    ax.invert_xaxis()
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    _save(fig, output_dir, "accuracy_delta_vs_baseline.png")
+    return fig
+
+
+def plot_accuracy_heatmap(
+    df_quality: pd.DataFrame,
+    metric_label: str,
+    output_dir="results",
+):
+    """Show method/retention accuracy as a compact heatmap."""
+    compressed = df_quality[df_quality["method"] != "none"].copy()
+    pivot = compressed.pivot_table(
+        index="method",
+        columns="retention_ratio",
+        values="score",
+        aggfunc="mean",
+    )
+    pivot = pivot.reindex(sorted(pivot.columns, reverse=True), axis=1)
+
+    fig, ax = plt.subplots(figsize=(8, 3.6))
+    im = ax.imshow(pivot.to_numpy(), aspect="auto", cmap="YlGnBu", vmin=0.4, vmax=0.9)
+    ax.set_xticks(range(len(pivot.columns)))
+    ax.set_xticklabels([f"{c:.2f}" for c in pivot.columns])
+    ax.set_yticks(range(len(pivot.index)))
+    ax.set_yticklabels(pivot.index)
+    ax.set_xlabel("Visual token retention ratio")
+    ax.set_title(f"{metric_label} by late-compression method")
+
+    for i in range(pivot.shape[0]):
+        for j in range(pivot.shape[1]):
+            value = pivot.iloc[i, j]
+            if pd.notna(value):
+                ax.text(j, i, f"{value:.3f}", ha="center", va="center", fontsize=8)
+
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label(metric_label)
+    fig.tight_layout()
+    _save(fig, output_dir, "accuracy_heatmap.png")
     return fig
 
 
@@ -171,95 +242,103 @@ def plot_tradeoff(
     return fig
 
 
-def plot_early_resize_tradeoff(
-    df_early_quality: pd.DataFrame,
-    df_early_perf: pd.DataFrame,
+def plot_quality_vs_sequence_reduction(
+    df_quality: pd.DataFrame,
+    df_effectiveness: pd.DataFrame,
     metric_label: str,
     output_dir="results",
 ):
-    """Plot quality, latency, and speedup for the early resize baseline."""
-    merged = df_early_quality.merge(
-        df_early_perf[
-            [
-                "method",
-                "retention_ratio",
-                "latency_ms",
-                "speed_vs_full_resolution",
-                "visual_tokens_after",
-            ]
-        ],
+    """Plot accuracy against actual LLM sequence reduction for late compression."""
+    effectiveness_cols = [
+        "method",
+        "retention_ratio",
+        "sequence_reduction_pct",
+        "visual_token_reduction_pct",
+    ]
+    merged = df_quality.merge(
+        df_effectiveness[[c for c in effectiveness_cols if c in df_effectiveness.columns]],
         on=["method", "retention_ratio"],
         how="inner",
-    ).dropna(subset=["score", "latency_ms"])
+    )
+    merged = merged[merged["method"] != "none"].dropna(subset=["score", "sequence_reduction_pct"])
 
     fig, ax = plt.subplots(figsize=(7, 5))
-    if merged.empty:
-        ax.set_title("Early resize quality-latency tradeoff unavailable")
-        fig.tight_layout()
-        _save(fig, output_dir, "early_resize_quality_latency_tradeoff.png")
-        return fig
-
-    merged = merged.sort_values("retention_ratio")
-    scatter = ax.scatter(
-        merged["latency_ms"],
-        merged["score"],
-        c=merged["speed_vs_full_resolution"],
-        cmap="viridis",
-        s=80,
-        edgecolor="black",
-        linewidth=0.5,
-    )
-    ax.plot(merged["latency_ms"], merged["score"], linewidth=1.5, alpha=0.7)
-    for _, row in merged.iterrows():
-        ax.annotate(
-            f"r={row['retention_ratio']:.2f}",
-            (row["latency_ms"], row["score"]),
-            fontsize=8,
-            xytext=(4, 4),
-            textcoords="offset points",
+    baseline = df_quality[df_quality["method"] == "none"]["score"].mean()
+    if pd.notna(baseline):
+        ax.axhline(
+            baseline,
+            color="black",
+            linestyle="--",
+            alpha=0.6,
+            label=f"baseline ({baseline:.3f})",
         )
 
-    cbar = fig.colorbar(scatter, ax=ax)
-    cbar.set_label("Speed vs full-resolution baseline")
-    ax.set_xlabel("End-to-end latency (ms)")
+    for method, group in merged.groupby("method"):
+        group = group.sort_values("sequence_reduction_pct")
+        ax.plot(
+            group["sequence_reduction_pct"],
+            group["score"],
+            marker="o",
+            linewidth=2,
+            label=method,
+        )
+        for _, row in group.iterrows():
+            ax.annotate(
+                f"{row['retention_ratio']:.2f}",
+                (row["sequence_reduction_pct"], row["score"]),
+                fontsize=7,
+                xytext=(3, 3),
+                textcoords="offset points",
+            )
+
+    ax.set_xlabel("Actual LLM sequence reduction (%)")
     ax.set_ylabel(metric_label)
-    ax.set_title("Early resize quality-latency tradeoff")
+    ax.set_title("Accuracy vs actual LLM sequence reduction")
     ax.grid(alpha=0.3)
+    ax.legend(fontsize=8)
     fig.tight_layout()
-    _save(fig, output_dir, "early_resize_quality_latency_tradeoff.png")
+    _save(fig, output_dir, "quality_vs_sequence_reduction.png")
     return fig
 
 
 def plot_late_compression_effectiveness(df_effectiveness: pd.DataFrame, output_dir="results"):
-    """Plot LLM-side proxy gains against measured end-to-end speed."""
-    fig, ax = plt.subplots(figsize=(8, 5))
+    """Plot readable late-compression optimization metrics."""
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
     sub = df_effectiveness[df_effectiveness["method"] != "none"].copy()
     if sub.empty:
-        ax.set_title("Late compression effectiveness unavailable")
+        axes[0].set_title("Late compression effectiveness unavailable")
         fig.tight_layout()
         _save(fig, output_dir, "late_compression_effectiveness.png")
         return fig
 
     for method, group in sub.groupby("method"):
         group = group.sort_values("retention_ratio")
-        ax.plot(
+        axes[0].plot(
             group["retention_ratio"],
-            group["attention_proxy_speedup"],
+            group["visual_token_reduction_pct"],
             marker="o",
             linewidth=2,
-            label=f"{method} attention proxy",
+            label=f"{method} visual tokens",
+        )
+        axes[0].plot(
+            group["retention_ratio"],
+            group["sequence_reduction_pct"],
+            marker="s",
+            linestyle="--",
+            linewidth=1.5,
+            label=f"{method} LLM sequence",
         )
         if "measured_llm_prefill_speedup" in group:
-            ax.plot(
+            axes[1].plot(
                 group["retention_ratio"],
                 group["measured_llm_prefill_speedup"],
                 marker="s",
                 linestyle="--",
                 linewidth=1.5,
-                label=f"{method} isolated prefill",
+                label=f"{method} isolated LLM prefill",
             )
         if "measured_end_to_end_speedup" in group:
-            ax.plot(
+            axes[1].plot(
                 group["retention_ratio"],
                 group["measured_end_to_end_speedup"],
                 marker="x",
@@ -268,13 +347,20 @@ def plot_late_compression_effectiveness(df_effectiveness: pd.DataFrame, output_d
                 label=f"{method} end-to-end",
             )
 
-    ax.axhline(1.0, color="black", linestyle="--", linewidth=1, alpha=0.6)
-    ax.set_xlabel("Visual token retention ratio")
-    ax.set_ylabel("Speedup or compute-reduction proxy")
-    ax.set_title("Late compression: LLM-side gains vs end-to-end speed")
-    ax.invert_xaxis()
-    ax.grid(alpha=0.3)
-    ax.legend(fontsize=7, ncol=2)
+    axes[0].set_xlabel("Visual token retention ratio")
+    axes[0].set_ylabel("Reduction (%)")
+    axes[0].set_title("Late compression reduces LLM-side sequence")
+    axes[0].invert_xaxis()
+    axes[0].grid(alpha=0.3)
+    axes[0].legend(fontsize=7, ncol=2)
+
+    axes[1].axhline(1.0, color="black", linestyle="--", linewidth=1, alpha=0.6)
+    axes[1].set_xlabel("Visual token retention ratio")
+    axes[1].set_ylabel("Measured speedup")
+    axes[1].set_title("Prefill gains do not become end-to-end speedup")
+    axes[1].invert_xaxis()
+    axes[1].grid(alpha=0.3)
+    axes[1].legend(fontsize=7, ncol=2)
     fig.tight_layout()
     _save(fig, output_dir, "late_compression_effectiveness.png")
     return fig
