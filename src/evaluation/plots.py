@@ -169,3 +169,62 @@ def plot_tradeoff(
     fig.tight_layout()
     _save(fig, output_dir, "quality_latency_tradeoff.png")
     return fig
+
+
+def plot_early_resize_tradeoff(
+    df_early_quality: pd.DataFrame,
+    df_early_perf: pd.DataFrame,
+    metric_label: str,
+    output_dir="results",
+):
+    """Plot quality, latency, and speedup for the early resize baseline."""
+    merged = df_early_quality.merge(
+        df_early_perf[
+            [
+                "method",
+                "retention_ratio",
+                "latency_ms",
+                "speed_vs_full_resolution",
+                "visual_tokens_after",
+            ]
+        ],
+        on=["method", "retention_ratio"],
+        how="inner",
+    ).dropna(subset=["score", "latency_ms"])
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    if merged.empty:
+        ax.set_title("Early resize quality-latency tradeoff unavailable")
+        fig.tight_layout()
+        _save(fig, output_dir, "early_resize_quality_latency_tradeoff.png")
+        return fig
+
+    merged = merged.sort_values("retention_ratio")
+    scatter = ax.scatter(
+        merged["latency_ms"],
+        merged["score"],
+        c=merged["speed_vs_full_resolution"],
+        cmap="viridis",
+        s=80,
+        edgecolor="black",
+        linewidth=0.5,
+    )
+    ax.plot(merged["latency_ms"], merged["score"], linewidth=1.5, alpha=0.7)
+    for _, row in merged.iterrows():
+        ax.annotate(
+            f"r={row['retention_ratio']:.2f}",
+            (row["latency_ms"], row["score"]),
+            fontsize=8,
+            xytext=(4, 4),
+            textcoords="offset points",
+        )
+
+    cbar = fig.colorbar(scatter, ax=ax)
+    cbar.set_label("Speed vs full-resolution baseline")
+    ax.set_xlabel("End-to-end latency (ms)")
+    ax.set_ylabel(metric_label)
+    ax.set_title("Early resize quality-latency tradeoff")
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    _save(fig, output_dir, "early_resize_quality_latency_tradeoff.png")
+    return fig
