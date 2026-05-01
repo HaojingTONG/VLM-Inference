@@ -219,9 +219,24 @@ def plot_tradeoff(
         .agg(latency_ms=("latency_ms", "mean"), peak_memory_mb=("peak_memory_mb", "max"))
     )
     merged = df_quality.merge(perf, on=["method", "retention_ratio"], how="inner")
+    baseline = merged[merged["method"] == "none"]
+    compressed = merged[merged["method"] != "none"].copy()
 
     fig, ax = plt.subplots(figsize=(7, 5))
-    for method, group in merged.groupby("method"):
+    if not baseline.empty:
+        row = baseline.iloc[0]
+        ax.axhline(row["score"], color="gray", linestyle="--", linewidth=1, alpha=0.5)
+        ax.axvline(row["latency_ms"], color="gray", linestyle="--", linewidth=1, alpha=0.5)
+        ax.annotate(
+            "baseline",
+            (row["latency_ms"], row["score"]),
+            fontsize=8,
+            xytext=(5, 5),
+            textcoords="offset points",
+            color="dimgray",
+        )
+
+    for method, group in compressed.groupby("method"):
         group = group.sort_values("retention_ratio")
         ax.plot(group["latency_ms"], group["score"], marker="o", linewidth=1.8, label=method)
         for _, row in group.iterrows():
@@ -234,7 +249,7 @@ def plot_tradeoff(
             )
     ax.set_xlabel(f"Latency (ms, {resolution} resolution)")
     ax.set_ylabel(metric_label)
-    ax.set_title("Quality-latency tradeoff")
+    ax.set_title("Quality-latency tradeoff among compression methods")
     ax.grid(alpha=0.3)
     ax.legend(fontsize=8)
     fig.tight_layout()
