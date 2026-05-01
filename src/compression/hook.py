@@ -29,17 +29,22 @@ import torch
 class CompressedVLM:
     """Wrap a Qwen2.5-VL model + processor to apply visual token compression."""
 
-    def __init__(self, model, processor, compressor):
+    def __init__(self, model, processor, compressor, enable_debug=False):
         self.model = model
         self.processor = processor
         self.compressor = compressor
         self.image_token_id = self._resolve_image_token_id()
         self.spatial_merge_size = self._resolve_spatial_merge_size()
+        self.enable_debug = enable_debug
+        self.last_debug = {}
 
     @torch.no_grad()
     def generate(self, inputs, **gen_kwargs):
         """Run generate with optional visual token compression."""
+        self.last_debug = {}
         if self.compressor is None or inputs.get("pixel_values") is None:
+            if self.enable_debug:
+                self.last_debug = self._baseline_debug(inputs)
             return self.model.generate(**inputs, **gen_kwargs)
         return self._generate_with_compression(inputs, **gen_kwargs)
 
@@ -67,17 +72,29 @@ class CompressedVLM:
         attention_mask = inputs["attention_mask"]
         pixel_values = inputs["pixel_values"]
         image_grid_thw = inputs["image_grid_thw"]
+        debug = self._input_debug(inputs) if self.enable_debug else {}
 
         # Run vision tower once and split per-image
         per_image = self._compute_image_embeds(pixel_values, image_grid_thw)
+        if self.enable_debug:
+            debug["visual_embedding_shapes_before_compression"] = [
+                list(emb.shape) for emb in per_image
+            ]
 
         merge = self.spatial_merge_size
         old_lens = (image_grid_thw.prod(dim=-1) // (merge * merge)).tolist()
+        if self.enable_debug:
+            debug["visual_tokens_before_per_image"] = [int(x) for x in old_lens]
+            debug["visual_tokens_before_total"] = int(sum(old_lens))
 
         # Compress each image's visual tokens
         compressed_per_image = [
             self.compressor.compress(emb.unsqueeze(0)).squeeze(0) for emb in per_image
         ]
+        if self.enable_debug:
+            debug["visual_embedding_shapes_after_compression_raw"] = [
+                list(emb.shape) for emb in compressed_per_image
+            ]
 
         # Cast each per-image tensor to model dtype/device so the model's
         # downstream masked_scatter / cat / .to() in forward all succeed.
@@ -87,6 +104,12 @@ class CompressedVLM:
             for emb in compressed_per_image
         ]
         new_lens = [emb.shape[0] for emb in compressed_per_image]
+        if self.enable_debug:
+            debug["visual_tokens_after_per_image"] = [int(x) for x in new_lens]
+            debug["visual_tokens_after_total"] = int(sum(new_lens))
+            debug["visual_embedding_shapes_after_compression"] = [
+                list(emb.shape) for emb in compressed_per_image
+            ]
 
         # Shrink each image_pad run in input_ids/attention_mask to match
         new_input_ids, new_attention_mask = self._rewrite_image_spans(
@@ -107,7 +130,42 @@ class CompressedVLM:
             "pixel_values": pixel_values,
             "image_grid_thw": new_image_grid_thw,
         }
+        if self.enable_debug:
+            debug.update(self._prepared_debug(prepared))
+            debug["effective_retention_ratio"] = (
+                debug["visual_tokens_after_total"] / debug["visual_tokens_before_total"]
+                if debug["visual_tokens_before_total"]
+                else None
+            )
+            debug["nominal_retention_ratio"] = float(
+                getattr(self.compressor, "retention_ratio", 1.0)
+            )
+            debug["compression_method"] = type(self.compressor).__name__
+            debug["input_sequence_length_delta"] = (
+                debug["prepared_input_ids_shape"][1] - debug["input_ids_shape"][1]
+            )
+            self.last_debug = debug
         return prepared, compressed_per_image
+
+    def inspect_prepared_inputs(self, inputs):
+        """Return the actual inputs that would enter generate plus debug metadata.
+
+        This is intended for diagnostics. For compressed runs it executes the
+        same preparation path as ``generate`` up to, but not including, the
+        final LLM ``generate`` call. For baseline it returns the original
+        inputs and a comparable debug dictionary.
+        """
+        old_debug = self.enable_debug
+        self.enable_debug = True
+        try:
+            if self.compressor is None or inputs.get("pixel_values") is None:
+                debug = self._baseline_debug(inputs)
+                self.last_debug = debug
+                return inputs, [], debug
+            prepared, compressed_per_image = self._prepare_compressed_inputs(inputs)
+            return prepared, compressed_per_image, dict(self.last_debug)
+        finally:
+            self.enable_debug = old_debug
 
     # --- monkey-patch helpers ---
     def _patch_get_image_features(self, compressed_per_image):
@@ -339,3 +397,91 @@ class CompressedVLM:
         if vcfg is not None and hasattr(vcfg, "spatial_merge_size"):
             return vcfg.spatial_merge_size
         return 2  # Qwen2.5-VL default
+
+    # --- diagnostics helpers ---
+    @staticmethod
+    def _shape(value):
+        return list(value.shape) if isinstance(value, torch.Tensor) else None
+
+    def _input_debug(self, inputs):
+        input_ids = inputs.get("input_ids")
+        attention_mask = inputs.get("attention_mask")
+        image_grid_thw = inputs.get("image_grid_thw")
+        pixel_values = inputs.get("pixel_values")
+        debug = {
+            "input_ids_shape": self._shape(input_ids),
+            "attention_mask_shape": self._shape(attention_mask),
+            "image_grid_thw_shape": self._shape(image_grid_thw),
+            "pixel_values_shape": self._shape(pixel_values),
+            "spatial_merge_size": int(self.spatial_merge_size),
+        }
+        if input_ids is not None:
+            debug["input_sequence_length"] = int(input_ids.shape[1])
+            debug["image_placeholder_count_total"] = int(
+                (input_ids == self.image_token_id).sum().item()
+            )
+        if attention_mask is not None:
+            debug["attention_mask_active_tokens"] = int(attention_mask.sum().item())
+        if image_grid_thw is not None:
+            debug["image_grid_thw"] = image_grid_thw.detach().cpu().tolist()
+        return debug
+
+    def _prepared_debug(self, prepared):
+        input_ids = prepared.get("input_ids")
+        attention_mask = prepared.get("attention_mask")
+        image_grid_thw = prepared.get("image_grid_thw")
+        debug = {
+            "prepared_input_ids_shape": self._shape(input_ids),
+            "prepared_attention_mask_shape": self._shape(attention_mask),
+            "prepared_image_grid_thw_shape": self._shape(image_grid_thw),
+        }
+        if input_ids is not None:
+            debug["prepared_sequence_length"] = int(input_ids.shape[1])
+            debug["prepared_image_placeholder_count_total"] = int(
+                (input_ids == self.image_token_id).sum().item()
+            )
+        if attention_mask is not None:
+            debug["prepared_attention_mask_active_tokens"] = int(attention_mask.sum().item())
+        if image_grid_thw is not None:
+            debug["prepared_image_grid_thw"] = image_grid_thw.detach().cpu().tolist()
+        return debug
+
+    def _baseline_debug(self, inputs):
+        debug = self._input_debug(inputs)
+        debug.update(
+            {
+                "compression_method": "none",
+                "nominal_retention_ratio": 1.0,
+                "effective_retention_ratio": 1.0,
+                "visual_tokens_before_per_image": [],
+                "visual_tokens_after_per_image": [],
+            }
+        )
+        image_grid_thw = inputs.get("image_grid_thw")
+        if image_grid_thw is not None:
+            merge = self.spatial_merge_size
+            lens = (image_grid_thw.prod(dim=-1) // (merge * merge)).tolist()
+            debug["visual_tokens_before_per_image"] = [int(x) for x in lens]
+            debug["visual_tokens_after_per_image"] = [int(x) for x in lens]
+            debug["visual_tokens_before_total"] = int(sum(lens))
+            debug["visual_tokens_after_total"] = int(sum(lens))
+        else:
+            count = debug.get("image_placeholder_count_total")
+            debug["visual_tokens_before_total"] = count
+            debug["visual_tokens_after_total"] = count
+        debug.update(
+            {
+                "prepared_input_ids_shape": debug.get("input_ids_shape"),
+                "prepared_attention_mask_shape": debug.get("attention_mask_shape"),
+                "prepared_image_grid_thw_shape": debug.get("image_grid_thw_shape"),
+                "prepared_sequence_length": debug.get("input_sequence_length"),
+                "prepared_attention_mask_active_tokens": debug.get(
+                    "attention_mask_active_tokens"
+                ),
+                "prepared_image_placeholder_count_total": debug.get(
+                    "image_placeholder_count_total"
+                ),
+                "input_sequence_length_delta": 0,
+            }
+        )
+        return debug
