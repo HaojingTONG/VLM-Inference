@@ -53,7 +53,6 @@ results/                     # Experiment outputs
 - [x] Dataset loaders (VQA-v2 skeleton, synthetic dataset with controllable resolution)
 - [x] Evaluation pipeline and quality metrics
 - [x] Benchmark runner with method x ratio x resolution grid
-- [x] NYU HPC Slurm job script
 
 ## TODO
 
@@ -62,7 +61,6 @@ results/                     # Experiment outputs
 - [ ] Add multi-image input support
 - [ ] Run baseline experiments on HPC
 - [ ] Visualization notebooks (latency-accuracy curves, memory plots)
-- [ ] (Optional) LLaVA-v1.6-7B comparison experiments
 
 ## Quick Start
 
@@ -75,11 +73,9 @@ python scripts/run_single.py --image path/to/image.jpg --method fixed_ratio --ra
 # Full benchmark
 python scripts/run_benchmark.py --config configs/default.yaml
 
-# Submit to NYU HPC
-sbatch scripts/submit_hpc.sh
 ```
 
 ## Hardware
 
-- NYU HPC cluster, NVIDIA A100 GPUs, single-node
+- NVIDIA A100 GPUs, Tesla T4 GPUs, single-node
 - PyTorch 2.x + HuggingFace Transformers + FlashAttention-2
