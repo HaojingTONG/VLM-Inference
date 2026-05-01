@@ -27,6 +27,7 @@ if str(REPO_ROOT) not in sys.path:
 from src.models import load_model
 from src.evaluation.diagnostics import (
     diagnose_speedup_root_cause,
+    early_resize_sanity_check,
     extreme_compression_sanity_check,
     sequence_length_diagnostics,
     stage_timing_breakdown,
@@ -108,7 +109,26 @@ def main():
     )
     extreme_df.to_csv(output / "extreme_compression_sanity.csv", index=False)
 
-    diagnosis = diagnose_speedup_root_cause(sequence_df, stage_summary, extreme_df)
+    print("Running early resize/token-budget sanity check...")
+    early_resize_df = early_resize_sanity_check(
+        model=model,
+        processor=processor,
+        image=image,
+        prompt=args.prompt,
+        retention_ratios=ratios,
+        max_new_tokens=1,
+        num_warmup=args.num_warmup,
+        num_runs=args.num_runs,
+        resolution=(height, width),
+    )
+    early_resize_df.to_csv(output / "early_resize_sanity.csv", index=False)
+
+    diagnosis = diagnose_speedup_root_cause(
+        sequence_df,
+        stage_summary,
+        extreme_df,
+        early_resize_df=early_resize_df,
+    )
     (output / "diagnosis_summary.md").write_text(diagnosis)
     print("\nDiagnosis summary:\n")
     print(diagnosis)

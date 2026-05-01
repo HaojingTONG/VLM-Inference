@@ -41,6 +41,7 @@ Expected outputs:
 - `stage_timing_per_run.csv`
 - `stage_timing_summary.csv`
 - `extreme_compression_sanity.csv`
+- `early_resize_sanity.csv`
 - `diagnosis_summary.md`
 
 ## Interpretation Checklist
@@ -72,6 +73,17 @@ Expected outputs:
      practical speedup. Treat that as evidence that token-count reduction is
      not translating into wall-clock improvement.
 
+4. **Early compression sanity**
+   - In `early_resize_sanity.csv`, compare `speed_vs_full_resolution`.
+   - This is an early token-budget baseline: it resizes the image before the
+     processor and vision encoder so fewer visual tokens are produced at the
+     source.
+   - If early resize speeds up while late embedding compression does not, the
+     root cause is likely that late compression misses the expensive vision
+     path and adds wrapper overhead.
+   - This is not the same algorithm as token pruning/merging, so report it as
+     an early-compression baseline rather than as the final method.
+
 ## Likely Root Cause Before Running Diagnostics
 
 From the code audit, the most likely explanation is a combination of:
@@ -83,6 +95,8 @@ From the code audit, the most likely explanation is a combination of:
 - Prior benchmarks used `max_new_tokens=1` to isolate prefill, which is correct
   for visual-token effects, but the measured path still includes compressed-path
   overhead.
+- The new `early_resize_sanity.csv` output tests Fix 1 directly by reducing
+  visual tokens before processor and vision encoder compute.
 
 ## Highest-Impact Fixes to Try Next
 

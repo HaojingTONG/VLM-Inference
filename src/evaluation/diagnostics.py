@@ -23,6 +23,7 @@ from PIL import Image
 from src.compression import CompressedVLM
 from src.evaluation.experiments import (
     build_compressed_wrapper,
+    get_image_token_id,
     make_random_image,
 )
 
@@ -198,6 +199,61 @@ def build_qwen_inputs_timed(processor, device: str, image: Image.Image, prompt: 
         inputs = inputs.to(device)
 
     return inputs, dict(times)
+
+
+def resize_image_for_retention(
+    image: Image.Image,
+    retention_ratio: float,
+    patch_multiple: int = 28,
+) -> Image.Image:
+    """Resize image area by retention before Qwen processing.
+
+    Qwen2.5-VL's merged visual-token grid is roughly one token per 28x28
+    pixels. Scaling image width/height by sqrt(retention) approximates a
+    retention-ratio token budget before the processor and vision encoder run.
+
+    This is not the same algorithm as pruning/merging embeddings. It is an
+    early-compression baseline used to test whether moving token reduction
+    before the vision encoder can produce wall-clock savings.
+    """
+    retention_ratio = float(retention_ratio)
+    if retention_ratio >= 1.0:
+        return image.copy()
+    if retention_ratio <= 0:
+        raise ValueError("retention_ratio must be positive.")
+
+    scale = retention_ratio ** 0.5
+    width, height = image.size
+    new_width = max(patch_multiple, int(round(width * scale / patch_multiple)) * patch_multiple)
+    new_height = max(patch_multiple, int(round(height * scale / patch_multiple)) * patch_multiple)
+    if (new_width, new_height) == (width, height):
+        return image.copy()
+    resample = getattr(Image, "Resampling", Image).BICUBIC
+    return image.resize((new_width, new_height), resample=resample)
+
+
+def _input_token_debug(model, processor, inputs):
+    image_token_id = get_image_token_id(model, processor)
+    input_ids = inputs.get("input_ids")
+    attention_mask = inputs.get("attention_mask")
+    image_grid_thw = inputs.get("image_grid_thw")
+    visual_tokens = None
+    if input_ids is not None:
+        visual_tokens = int((input_ids == image_token_id).sum().item())
+    return {
+        "input_ids_shape": _shape(input_ids),
+        "attention_mask_shape": _shape(attention_mask),
+        "image_grid_thw_shape": _shape(image_grid_thw),
+        "pixel_values_shape": _shape(inputs.get("pixel_values")),
+        "input_sequence_length": int(input_ids.shape[1]) if input_ids is not None else None,
+        "attention_mask_active_tokens": int(attention_mask.sum().item())
+        if attention_mask is not None
+        else None,
+        "visual_tokens_total": visual_tokens,
+        "image_grid_thw": image_grid_thw.detach().cpu().tolist()
+        if image_grid_thw is not None
+        else None,
+    }
 
 
 def sequence_length_diagnostics(
@@ -526,10 +582,115 @@ def extreme_compression_sanity_check(
     return df
 
 
+def early_resize_sanity_check(
+    model,
+    processor,
+    image: Image.Image | None = None,
+    prompt: str = "Describe this image in detail.",
+    device: str = "cuda",
+    retention_ratios: list[float] | None = None,
+    max_new_tokens: int = 1,
+    num_warmup: int = 1,
+    num_runs: int = 5,
+    resolution: tuple[int, int] = (896, 896),
+) -> pd.DataFrame:
+    """Measure an early token-budget baseline by resizing before processing."""
+    retention_ratios = retention_ratios or [1.0, 0.5, 0.25, 0.1, 0.05, 0.01]
+    image = image or make_random_image(resolution[0], resolution[1], seed=2027)
+    rows = []
+
+    for ratio in retention_ratios:
+        resized = resize_image_for_retention(image, ratio)
+        wrapper = build_compressed_wrapper(model, processor, "none", 1.0)
+
+        def run_once():
+            stage = defaultdict(float)
+            with _timed(stage, "early_resize_ms"):
+                img = resize_image_for_retention(image, ratio)
+            with _timed(stage, "input_build_total_ms"):
+                inputs, build_times = build_qwen_inputs_timed(processor, device, img, prompt)
+            stage.update(build_times)
+            with torch.no_grad(), ModuleShapeRecorder(model) as recorder:
+                with _timed(stage, "generate_ms"):
+                    output = wrapper.generate(
+                        inputs,
+                        max_new_tokens=max_new_tokens,
+                        do_sample=False,
+                    )
+            debug = _input_token_debug(model, processor, inputs)
+            first_layer_event = next(
+                (event for event in recorder.events if event["role"] == "llm_layer"),
+                None,
+            )
+            first_attn_event = next(
+                (event for event in recorder.events if event["role"] == "attention"),
+                None,
+            )
+            if first_layer_event:
+                debug["first_llm_layer_input_tensor_shape"] = first_layer_event[
+                    "first_input_tensor_shape"
+                ]
+            if first_attn_event:
+                debug["first_attention_output_tensor_shape"] = first_attn_event[
+                    "first_output_tensor_shape"
+                ]
+            return output, stage, debug
+
+        for _ in range(num_warmup):
+            run_once()
+            _sync()
+
+        times = []
+        stage_rows = []
+        debug = {}
+        for _ in range(num_runs):
+            _sync()
+            start = time.perf_counter()
+            _, stage, debug = run_once()
+            _sync()
+            times.append((time.perf_counter() - start) * 1000.0)
+            stage_rows.append(dict(stage))
+
+        stage_means = {
+            key: float(np.mean([row.get(key, 0.0) for row in stage_rows]))
+            for key in sorted({key for row in stage_rows for key in row})
+        }
+        rows.append(
+            {
+                "method": "early_resize",
+                "retention_ratio": ratio,
+                "original_width": image.size[0],
+                "original_height": image.size[1],
+                "resized_width": resized.size[0],
+                "resized_height": resized.size[1],
+                "latency_ms": float(np.mean(times)),
+                "latency_std_ms": float(np.std(times)),
+                "visual_tokens_after": debug.get("visual_tokens_total"),
+                "input_sequence_length": debug.get("input_sequence_length"),
+                "first_llm_layer_input_tensor_shape": debug.get(
+                    "first_llm_layer_input_tensor_shape"
+                ),
+                "first_attention_output_tensor_shape": debug.get(
+                    "first_attention_output_tensor_shape"
+                ),
+                **stage_means,
+            }
+        )
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    df = pd.DataFrame(rows)
+    baseline = df[df["retention_ratio"] == 1.0]["latency_ms"].mean()
+    if baseline:
+        df["speed_vs_full_resolution"] = baseline / df["latency_ms"]
+    return df
+
+
 def diagnose_speedup_root_cause(
     sequence_df: pd.DataFrame,
     stage_summary_df: pd.DataFrame,
     extreme_df: pd.DataFrame,
+    early_resize_df: pd.DataFrame | None = None,
 ) -> str:
     """Generate a concise diagnosis from diagnostic tables."""
     lines = []
@@ -583,6 +744,26 @@ def diagnose_speedup_root_cause(
                     f"Extreme compression can speed up at least one setting: "
                     f"{row['method']} r={row['retention_ratio']} reached "
                     f"{row['speed_vs_baseline']:.2f}x baseline."
+                )
+
+    if early_resize_df is not None and not early_resize_df.empty:
+        best = early_resize_df[early_resize_df["retention_ratio"] < 1.0].sort_values(
+            "speed_vs_full_resolution", ascending=False
+        )
+        if not best.empty:
+            row = best.iloc[0]
+            if row["speed_vs_full_resolution"] > 1.05:
+                lines.append(
+                    "Early resize/token-budget compression does improve latency "
+                    f"({row['speed_vs_full_resolution']:.2f}x at retention "
+                    f"{row['retention_ratio']}). This supports the diagnosis that "
+                    "late embedding compression misses the expensive vision path."
+                )
+            else:
+                lines.append(
+                    "Early resize/token-budget compression also did not materially "
+                    "improve latency in this run; investigate processor/model fixed "
+                    "overheads and measurement settings."
                 )
 
     lines.append(
