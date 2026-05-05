@@ -79,6 +79,35 @@ The notebook also avoids misleading metric names:
 - If the dataset does not support official VQA scoring, it falls back to clearly
   named exact-match metrics.
 
+## Project Milestones and Completion Status
+
+The proposal/checkpoint described five main milestones. The table below maps those milestones to the current repository state.
+
+| Proposal milestone | Current status | What is completed in this repository | Remaining work |
+|---|---:|---|---|
+| 1. Environment setup and baseline establishment | Complete | Colab A100 setup, GPU checks, Qwen2.5-VL/Qwen2-VL model loading, dtype/device-map support, baseline no-compression inference, latency/memory/throughput profiling | HPC/Slurm scripts from the original proposal are not included in this Colab-focused repo |
+| 2. Compression strategy implementation | Complete for standalone baselines, internal Qwen hooks | Implemented `none`, `fixed`, `importance`, and `merging` under a shared interface. Fixed-ratio pruning is wired into Qwen2.5-VL's real visual-token path | Importance pruning and token merging still need full internal Qwen2.5-VL sequence reconstruction |
+| 3. Benchmark execution across resolutions and image densities | Complete | `run_benchmark.py` supports method, retention ratio, image resolution, number of images, sample count, and max generation length sweeps | Large external benchmark datasets are future work |
+| 4. Efficiency-accuracy trade-off analysis | Complete | Per-run CSV logging, summary tables, latency/memory/throughput/accuracy plots, strict synthetic VQA/OCR quality metric | Final numeric claims should be generated on the same Colab A100 runtime for reproducibility |
+| 5. Reproducible benchmark suite and demo | Complete | Modular source tree, `configs/default.yaml`, Colab demo notebook, plotting utilities, README commands, fallback model path | Add final run artifacts, such as committed charts or attached report figures, after running the benchmark |
+
+## Completed Implementation Results
+
+The current repository delivers the following concrete artifacts:
+
+- a modular project scaffold with YAML-based experiment configuration,
+- a Colab-ready Qwen2.5-VL/Qwen2-VL model loading pipeline,
+- a unified inference API for image(s) plus text prompts,
+- three training-free compression baselines behind one interface,
+- a real Qwen2.5-VL internal fixed-pruning adapter inserted between the vision encoder and LLM prefill,
+- a 50-sample synthetic stress VQA/OCR benchmark,
+- strict answer-quality scoring with `all_keywords_match`,
+- per-run profiling for latency, throughput, peak GPU memory, visual-token counts, generated answers, and OOM status,
+- CSV result export and notebook visualizations for efficiency-accuracy trade-off analysis.
+
+The main implementation result is not a newly trained model. Instead, it is a reproducible inference-time compression benchmark that can show how visual-token reduction changes speed, memory, and accuracy for Qwen-style VLM inference.
+
+
 ## Repository Layout
 
 ```text
