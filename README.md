@@ -632,3 +632,92 @@ The safest interpretation of the final project is:
 - Future work should move compression earlier, make retention adaptive, and
   replace Python-level hooks with optimized in-model or kernel-level
   implementations.
+
+## Results From `notebooks/colab_demo.ipynb`
+
+
+### Demo Benchmark Setup
+
+The quick benchmark command in the notebook is:
+
+```bash
+python run_benchmark.py --quick \
+  --model-id Qwen/Qwen2.5-VL-3B-Instruct \
+  --dtype fp16 \
+  --attn-implementation eager \
+  --methods none,fixed,importance,merging \
+  --ratios 1.0,0.75,0.5,0.25,0.1,0.05 \
+  --samples 50 \
+  --no-plots
+```
+
+The synthetic task set includes OCR, receipt reading, dot counting, chart
+lookup, and spatial-reference questions. The notebook saves:
+
+```text
+results/benchmark_results.csv
+results/summary_results.csv
+results/notebook_tradeoff_summary.png
+results/notebook_accuracy_comparison.png
+results/notebook_accuracy_latency_retention_tradeoff.png
+```
+
+### Summary Table
+
+The no-compression baseline in the saved demo run was:
+
+| Method | Retention | Latency (ms) | Throughput (tokens/s) | Peak memory (MB) | Quality score |
+|---|---:|---:|---:|---:|---:|
+| none | 1.00 | 1042.2 | 7.72 | 7772.7 | 0.833 |
+
+The most useful compressed settings were:
+
+| Method | Retention | Visual tokens | Latency (ms) | Latency reduction | Throughput (tokens/s) | Memory reduction | Quality score |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| token merging | 0.25 | 121 | 578.6 | 44.5% | 14.22 | 7.2% | 0.833 |
+| importance pruning | 0.25 | 121 | 616.9 | 40.8% | 13.41 | 7.2% | 0.833 |
+| token merging | 0.50 | 256 | 765.5 | 26.5% | 10.99 | 5.7% | 0.833 |
+| importance pruning | 0.50 | 256 | 748.1 | 28.2% | 11.26 | 5.7% | 0.833 |
+
+For comparison, fixed-ratio pruning was weaker under stronger compression:
+
+| Method | Retention | Latency (ms) | Latency reduction | Quality score |
+|---|---:|---:|---:|---:|
+| fixed pruning | 0.25 | 892.0 | 14.4% | 0.500 |
+| fixed pruning | 0.50 | 964.8 | 7.4% | 0.750 |
+| fixed pruning | 0.75 | 1036.9 | 0.5% | 0.833 |
+
+### Main Observations
+
+1. **Moderate compression preserved demo quality.**
+   - Token merging and importance pruning at 0.25 and 0.50 retention matched
+     the baseline quality score of 0.833 in this run.
+
+2. **Token merging had the best observed latency-quality tradeoff.**
+   - At 0.25 retention, token merging reduced latency from 1042.2 ms to
+     578.6 ms while preserving the benchmark quality score.
+
+3. **Importance pruning was a strong practical alternative.**
+   - At 0.25 retention, it reached the same quality score with 40.8% latency
+     reduction.
+
+4. **Fixed pruning was useful as a baseline but less robust.**
+   - It reduced token count but lost much more quality at 0.25 retention because
+     it uniformly drops tokens without considering image content.
+
+5. **Extreme compression hurt quality.**
+   - At 0.05 or 0.10 retention, importance pruning and token merging were fast
+     but quality dropped sharply. This supports using moderate retention rather
+     than compressing as aggressively as possible.
+
+6. **Peak memory fell much less than token count.**
+   - The best demo settings reduced total peak memory by about 7.2%, not by the
+     full 75% token-reduction amount, because model weights, the vision encoder,
+     PyTorch/CUDA allocation behavior, and other fixed pipeline costs still
+     dominate total GPU memory.
+
+Overall, the demo supports the presentation claim that visual-token compression
+can expose a useful accuracy-efficiency tradeoff. The strongest honest
+conclusion is that **importance pruning and token merging preserve benchmark
+quality at moderate retention while reducing latency in this controlled demo**.
+
