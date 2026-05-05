@@ -12,11 +12,48 @@ The main analysis artifact is:
 ```text
 notebooks/colab_run.ipynb
 ```
+Team members from the original project proposal/checkpoint:
+
+Haojing Tong (ht2667)
+Yuqi Wang (yw4338)
+Primary runtime target: Google Colab A100 GPU.
+Primary model: Qwen/Qwen2.5-VL-3B-Instruct.
+
 
 It is intended to run on Google Colab or a GPU environment such as an NVIDIA
 A100. The notebook validates the dataset schema, runs corrected quality
 evaluation, benchmarks baseline and compressed inference, saves CSV/JSON
 results, and generates presentation-ready plots.
+
+## Executive Summary
+High-performance VLMs can generate hundreds or thousands of visual tokens for high-resolution or multi-image inputs. These tokens are passed into the language model during inference, increasing prefill cost, KV-cache size, GPU memory usage, latency, and limiting throughput.
+
+This project implements a reproducible benchmark suite for evaluating visual token compression. It compares:
+
+full visual tokens with no compression,
+fixed-ratio visual token pruning,
+importance-based visual token pruning,
+token merging.
+The most important engineering component is a model-aware Qwen2.5-VL fixed-ratio pruning adapter. It intercepts visual embeddings after Qwen2.5-VL's visual encoder and before LLM prefill, prunes image embeddings, and rebuilds the sequence metadata required by Qwen2.5-VL generation. This creates a genuinely shorter LLM input sequence instead of only simulating compression at the image level.
+
+The benchmark records latency, throughput, peak GPU memory, visual-token counts, generated answers, strict VQA-style accuracy, and OOM/success status. A 50-sample synthetic stress VQA/OCR dataset is included so compression-induced accuracy degradation is visible even without downloading external datasets.
+
+## Relation to the Original Proposal
+The original proposal aimed to study Efficiency-Accuracy Trade-off for visual token compression under a benchmark grid:
+
+image resolution: low, medium, high,
+image density: 1, 2, and 4 images per prompt,
+compression intensity: 100% down to aggressive retention ratios,
+metrics: latency, throughput, peak GPU memory, OOM behavior, and answer quality.
+This repository implements that direction with a Colab-first stack:
+
+PyTorch and Hugging Face Transformers instead of an HPC/Slurm-first setup,
+Qwen2.5-VL-3B-Instruct as the main model,
+Qwen2-VL-2B-Instruct as a fallback,
+real internal fixed-ratio pruning for Qwen2.5-VL,
+standalone/proxy baselines for importance pruning and token merging,
+CSV logging and notebook plots for efficiency-accuracy trade-off analysis.
+The proposal also discussed attention-based pruning, ToMe-style bipartite merging, vLLM/DeepSpeed, and large external VQA benchmarks. Those are kept as future extensions. The current implementation prioritizes a stable, reproducible Colab A100 workflow.
 
 ## What This Project Claims
 
